@@ -1,6 +1,7 @@
 from sklearn.metrics import confusion_matrix
 import numpy as np
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
 import os, argparse
 
 from data import (
@@ -38,6 +39,7 @@ def eval(
     medusa_input_tensor="input_1:0",
     medusa_input_size=256, 
 ):
+    
     y_test = []
     pred = []
 
@@ -47,23 +49,44 @@ def eval(
 
         y_test.append(mapping[line[2]])
 
-        if is_medusa_backbone:
-            x = process_image_file(image_file, input_size, top_percent=0, crop=False)
-            x = x.astype('float32') / 255.0
-            medusa_x = process_image_file_medusa(image_file, medusa_input_size)
-            feed_dict = {
-                medusa_input_tensor: np.expand_dims(medusa_x, axis=0),
-                input_tensor: np.expand_dims(x, axis=0),
-            }
-        else:
-            x = process_image_file(image_file, input_size, top_percent=0.08)
-            x = x.astype('float32') / 255.0
-            feed_dict = {input_tensor: np.expand_dims(x, axis=0)}
+        try:
+            if is_medusa_backbone:
+                x = process_image_file(image_file, input_size, top_percent=0, crop=False)
+                if x is None:
+                    print(f"Failed to process image (Medusa backbone): {image_file}")
+                    continue
+                x = x.astype('float32') / 255.0
+                medusa_x = process_image_file_medusa(image_file, medusa_input_size)
+                if medusa_x is None:
+                    print(f"Failed to process Medusa image: {image_file}")
+                    continue
+                feed_dict = {
+                    medusa_input_tensor: np.expand_dims(medusa_x, axis=0),
+                    input_tensor: np.expand_dims(x, axis=0),
+                }
+            else:
+                x = process_image_file(image_file, input_size, top_percent=0.08)
+                if x is None:
+                    print(f"Failed to process image: {image_file}")
+                    continue
+                x = x.astype('float32') / 255.0
+                feed_dict = {input_tensor: np.expand_dims(x, axis=0)}
+            
+            prediction = np.array(sess.run(output_tensor, feed_dict=feed_dict)).argmax(axis=1)
+            print(prediction,"predictions")
+            
+            pred.append(prediction)
         
-        pred.append(np.array(sess.run(output_tensor, feed_dict=feed_dict)).argmax(axis=1))
+        except Exception as e:
+            print(f"Error processing image {image_file}: {e}")
+            continue
     
     y_test = np.array(y_test)
     pred = np.array(pred)
+    print("Testfolder", testfolder)
+    print("testfiles", testfile[0])
+    print(f"Length of y_test: {len(y_test)}")
+    print(f"Length of pred: {len(pred)}")
 
     print_metrics(y_test, pred, mapping)
 
