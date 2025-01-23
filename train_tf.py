@@ -1,5 +1,6 @@
 from __future__ import print_function
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
 import os, argparse, pathlib
 
 from eval import eval
@@ -58,6 +59,7 @@ with open(args.trainfile) as f:
     trainfiles = f.readlines()
 with open(args.testfile) as f:
     testfiles = f.readlines()
+    
 
 if args.is_severity_model:
     # For COVIDNet CXR-S severity level 1 and 2 detection using COVIDxSev dataset
@@ -97,67 +99,67 @@ generator = BalanceCovidDataset(data_dir=args.datadir,
                                 class_weights=class_weights,
                                 top_percent=args.top_percent,
                                 is_severity_model=args.is_severity_model)
+with tf.device('/cpu:0'):
+    with tf.Session() as sess:
+        tf.get_default_graph()
+        saver = tf.train.import_meta_graph(os.path.join(args.weightspath, args.metaname))
 
-with tf.Session() as sess:
-    tf.get_default_graph()
-    saver = tf.train.import_meta_graph(os.path.join(args.weightspath, args.metaname))
+        graph = tf.get_default_graph()
 
-    graph = tf.get_default_graph()
+        image_tensor = graph.get_tensor_by_name(args.in_tensorname)
+        labels_tensor = graph.get_tensor_by_name(args.label_tensorname)
+        sample_weights = graph.get_tensor_by_name(args.weights_tensorname)
+        pred_tensor = graph.get_tensor_by_name(args.logit_tensorname)
+        training_tensor = graph.get_tensor_by_name(args.training_tensorname)
+        # loss expects unscaled logits since it performs a softmax on logits internally for efficiency
 
-    image_tensor = graph.get_tensor_by_name(args.in_tensorname)
-    labels_tensor = graph.get_tensor_by_name(args.label_tensorname)
-    sample_weights = graph.get_tensor_by_name(args.weights_tensorname)
-    pred_tensor = graph.get_tensor_by_name(args.logit_tensorname)
-    training_tensor = graph.get_tensor_by_name(args.training_tensorname)
-    # loss expects unscaled logits since it performs a softmax on logits internally for efficiency
+        # Define loss and optimizer
+        loss_op = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(
+            logits=pred_tensor, labels=labels_tensor)*sample_weights)
+        optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
+        train_op = optimizer.minimize(loss_op)
 
-    # Define loss and optimizer
-    loss_op = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(
-        logits=pred_tensor, labels=labels_tensor)*sample_weights)
-    optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
-    train_op = optimizer.minimize(loss_op)
+        # Initialize the variables
+        init = tf.global_variables_initializer()
 
-    # Initialize the variables
-    init = tf.global_variables_initializer()
+        # Run the initializer
+        sess.run(init)
 
-    # Run the initializer
-    sess.run(init)
+        # load weights
+        saver.restore(sess, os.path.join(args.weightspath, args.ckptname))
+        #saver.restore(sess, tf.train.latest_checkpoint(args.weightspath))
 
-    # load weights
-    saver.restore(sess, os.path.join(args.weightspath, args.ckptname))
-    #saver.restore(sess, tf.train.latest_checkpoint(args.weightspath))
+        # save base model
+        saver.save(sess, os.path.join(runPath, 'model'))
+        print('Saved baseline checkpoint')
+        print('Baseline eval:')
+        eval(sess, graph, testfiles, os.path.join(args.datadir,'test'),
+            args.in_tensorname, args.out_tensorname, args.input_size, mapping)
 
-    # save base model
-    saver.save(sess, os.path.join(runPath, 'model'))
-    print('Saved baseline checkpoint')
-    print('Baseline eval:')
-    eval(sess, graph, testfiles, os.path.join(args.datadir,'test'),
-         args.in_tensorname, args.out_tensorname, args.input_size, mapping)
+        # Training cycle
+        print('Training started')
+        total_batch = len(generator)
+        progbar = tf.keras.utils.Progbar(total_batch)
+        for epoch in range(args.epochs):
+            for i in range(total_batch):
+                # Run optimization
+                batch_x, batch_y, weights, is_training = next(generator)
+                sess.run(train_op, feed_dict={image_tensor: batch_x,
+                                            labels_tensor: batch_y,
+                                            sample_weights: weights,
+                                            training_tensor: is_training})
+                progbar.update(i+1)
 
-    # Training cycle
-    print('Training started')
-    total_batch = len(generator)
-    progbar = tf.keras.utils.Progbar(total_batch)
-    for epoch in range(args.epochs):
-        for i in range(total_batch):
-            # Run optimization
-            batch_x, batch_y, weights, is_training = next(generator)
-            sess.run(train_op, feed_dict={image_tensor: batch_x,
-                                          labels_tensor: batch_y,
-                                          sample_weights: weights,
-                                          training_tensor: is_training})
-            progbar.update(i+1)
-
-        if epoch % display_step == 0:
-            pred = sess.run(pred_tensor, feed_dict={image_tensor:batch_x})
-            loss = sess.run(loss_op, feed_dict={pred_tensor: pred,
-                                                labels_tensor: batch_y,
-                                                sample_weights: weights})
-            print("Epoch:", '%04d' % (epoch + 1), "Minibatch loss=", "{:.9f}".format(loss))
-            eval(sess, graph, testfiles, os.path.join(args.datadir,'test'),
-                 args.in_tensorname, args.out_tensorname, args.input_size, mapping)
-            saver.save(sess, os.path.join(runPath, 'model'), global_step=epoch+1, write_meta_graph=False)
-            print('Saving checkpoint at epoch {}'.format(epoch + 1))
+            if epoch % display_step == 0:
+                pred = sess.run(pred_tensor, feed_dict={image_tensor:batch_x})
+                loss = sess.run(loss_op, feed_dict={pred_tensor: pred,
+                                                    labels_tensor: batch_y,
+                                                    sample_weights: weights})
+                print("Epoch:", '%04d' % (epoch + 1), "Minibatch loss=", "{:.9f}".format(loss))
+                eval(sess, graph, testfiles,os.path.join(args.datadir,'test'),
+                    args.in_tensorname, args.out_tensorname, args.input_size, mapping)
+                saver.save(sess, os.path.join(runPath, 'model'), global_step=epoch+1, write_meta_graph=False)
+                print('Saving checkpoint at epoch {}'.format(epoch + 1))
 
 
-print("Optimization Finished!")
+    print("Optimization Finished!")
